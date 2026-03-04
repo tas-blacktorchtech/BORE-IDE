@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
@@ -12,6 +12,195 @@ const viewVisibility = {
   editor: true,
   bottom: true,
 };
+const BORE_LAYOUT_FILE = 'ide-layout.json';
+const RECENT_PROJECTS_FILE = 'recent-projects.json';
+const MAX_RECENT_PROJECTS = 5;
+const SETTINGS_FILE = 'settings.json';
+const MAX_COMMAND_ALIASES = 64;
+
+function resolveAssetPath(fileName) {
+  const candidates = app.isPackaged
+    ? [path.join(__dirname, '..', 'dist', fileName), path.join(process.resourcesPath, fileName)]
+    : [path.join(__dirname, '..', 'public', fileName)];
+
+  return candidates.find((candidate) => fsSync.existsSync(candidate)) || null;
+}
+
+function resolveWindowIconPath() {
+  if (process.platform === 'win32') {
+    return resolveAssetPath('icon.ico') || resolveAssetPath('icon.png');
+  }
+
+  return resolveAssetPath('icon.png');
+}
+
+function setDockIconSafe() {
+  if (process.platform !== 'darwin' || !app.dock) {
+    return;
+  }
+
+  const candidates = [resolveAssetPath('icon.icns'), resolveAssetPath('icon.png')].filter(Boolean);
+  for (const iconPath of candidates) {
+    try {
+      const image = nativeImage.createFromPath(iconPath);
+      if (!image.isEmpty()) {
+        app.dock.setIcon(image);
+        return;
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+}
+
+function parseRepositoryName(repoUrl) {
+  const trimmed = repoUrl.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const withoutQuery = trimmed.split('?')[0].split('#')[0];
+  const lastSegment = withoutQuery.split(/[/:]/).at(-1);
+  if (!lastSegment) {
+    return null;
+  }
+
+  const normalized = lastSegment.endsWith('.git')
+    ? lastSegment.slice(0, -4)
+    : lastSegment;
+
+  return normalized.length > 0 ? normalized : null;
+}
+
+function runCommand(command, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, {
+      cwd,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stderr = '';
+
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on('error', (error) => {
+      reject(error);
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(stderr.trim() || `${command} exited with code ${code}`));
+    });
+  });
+}
+
+function getBoreLayoutPath(projectRoot) {
+  return path.join(projectRoot, '.bore', BORE_LAYOUT_FILE);
+}
+
+function getRecentProjectsPath() {
+  return path.join(app.getPath('userData'), RECENT_PROJECTS_FILE);
+}
+
+function getSettingsPath() {
+  return path.join(app.getPath('userData'), SETTINGS_FILE);
+}
+
+function normalizeCommandLineAliases(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const cleaned = [];
+  const seen = new Set();
+  const validTargets = new Set(['editor', 'explorer', 'terminal']);
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const keyword = typeof entry.keyword === 'string' ? entry.keyword.trim().toLowerCase() : '';
+    const target = typeof entry.target === 'string' ? entry.target.trim().toLowerCase() : '';
+    if (!keyword || keyword.length > 32 || !validTargets.has(target)) {
+      continue;
+    }
+
+    if (seen.has(keyword)) {
+      continue;
+    }
+    seen.add(keyword);
+
+    cleaned.push({ keyword, target });
+    if (cleaned.length >= MAX_COMMAND_ALIASES) {
+      break;
+    }
+  }
+
+  return cleaned;
+}
+
+function normalizeSettingsPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return { commandLineAliases: [] };
+  }
+
+  return {
+    commandLineAliases: normalizeCommandLineAliases(payload.commandLineAliases),
+  };
+}
+
+async function readSettings() {
+  try {
+    const raw = await fs.readFile(getSettingsPath(), 'utf8');
+    return normalizeSettingsPayload(JSON.parse(raw));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return { commandLineAliases: [] };
+    }
+    return { commandLineAliases: [] };
+  }
+}
+
+async function writeSettings(settings) {
+  await fs.mkdir(app.getPath('userData'), { recursive: true });
+  await fs.writeFile(getSettingsPath(), `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+}
+
+async function readRecentProjects() {
+  try {
+    const raw = await fs.readFile(getRecentProjectsPath(), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.filter((entry) => typeof entry === 'string' && path.isAbsolute(entry));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return [];
+    }
+    return [];
+  }
+}
+
+async function writeRecentProjects(projects) {
+  await fs.mkdir(app.getPath('userData'), { recursive: true });
+  await fs.writeFile(getRecentProjectsPath(), `${JSON.stringify(projects, null, 2)}\n`, 'utf8');
+}
+
+async function registerRecentProject(projectPath) {
+  const existing = await readRecentProjects();
+  const deduped = [projectPath, ...existing.filter((entry) => entry !== projectPath)];
+  await writeRecentProjects(deduped.slice(0, MAX_RECENT_PROJECTS));
+}
 
 function getShellConfig() {
   if (process.platform === 'win32') {
@@ -83,6 +272,7 @@ function isSafePathInput(value) {
 }
 
 function createWindow() {
+  const iconPath = resolveWindowIconPath();
   const win = new BrowserWindow({
     width: 1540,
     height: 960,
@@ -96,6 +286,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       sandbox: true,
     },
+    ...(iconPath ? { icon: iconPath } : {}),
   });
 
   if (app.isPackaged) {
@@ -103,6 +294,18 @@ function createWindow() {
   } else {
     win.loadURL('http://localhost:5173');
   }
+
+  win.webContents.on('context-menu', (_event, params) => {
+    const contextMenu = Menu.buildFromTemplate([
+      ...(params.isEditable ? [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }] : []),
+      { role: 'cut', enabled: params.editFlags.canCut },
+      { role: 'copy', enabled: params.editFlags.canCopy || params.selectionText.length > 0 },
+      { role: 'paste', enabled: params.editFlags.canPaste },
+      { role: 'selectAll' },
+    ]);
+
+    contextMenu.popup({ window: win });
+  });
 }
 
 function sendPanelVisibility(panelId, visible) {
@@ -148,7 +351,33 @@ function createApplicationMenu() {
       : []),
     {
       label: 'File',
-      submenu: [{ role: 'close' }],
+      submenu: [
+        {
+          label: 'Close Project',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (!win) {
+              return;
+            }
+
+            win.webContents.send('window:close-project-request');
+          },
+        },
+        { type: 'separator' },
+        { role: 'close' },
+      ],
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'selectAll' },
+      ],
     },
     {
       label: 'View',
@@ -181,19 +410,51 @@ function createApplicationMenu() {
           },
         },
         { type: 'separator' },
+        {
+          label: 'Toggle Command Line',
+          accelerator: 'CmdOrCtrl+K',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (!win) {
+              return;
+            }
+
+            win.webContents.send('window:toggle-command-line');
+          },
+        },
+        { type: 'separator' },
         { role: 'toggleDevTools' },
       ],
     },
     {
       label: 'Window',
-      submenu: [{ role: 'minimize' }, { role: 'zoom' }],
+      submenu: [
+        {
+          label: 'Save Panel Layout',
+          accelerator: 'CmdOrCtrl+Shift+L',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (!win) {
+              return;
+            }
+
+            win.webContents.send('window:save-layout-request');
+          },
+        },
+        { type: 'separator' },
+        { role: 'minimize' },
+        { role: 'zoom' },
+      ],
     },
   ];
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-app.whenReady().then(() => {
+app
+  .whenReady()
+  .then(() => {
+  setDockIconSafe();
   createApplicationMenu();
   createWindow();
 
@@ -202,7 +463,10 @@ app.whenReady().then(() => {
       createWindow();
     }
   });
-});
+  })
+  .catch((error) => {
+    console.error('[BORE] App startup failed:', error);
+  });
 
 app.on('window-all-closed', () => {
   for (const [, session] of terminals) {
@@ -226,6 +490,104 @@ ipcMain.handle('project:open', async () => {
   }
 
   return result.filePaths[0];
+});
+
+ipcMain.handle('project:prepare-folder', async (_event, folderPath) => {
+  if (!isSafePathInput(folderPath)) {
+    throw new Error('Invalid project folder path');
+  }
+
+  const stat = await fs.stat(folderPath);
+  if (!stat.isDirectory()) {
+    throw new Error('Project path must be a directory');
+  }
+
+  await fs.mkdir(path.join(folderPath, '.bore'), { recursive: true });
+  await registerRecentProject(folderPath);
+  return folderPath;
+});
+
+ipcMain.handle('project:clone', async (_event, repoUrl, destinationDirectory) => {
+  if (typeof repoUrl !== 'string' || repoUrl.trim().length === 0) {
+    throw new Error('Repository URL is required');
+  }
+
+  if (!isSafePathInput(destinationDirectory)) {
+    throw new Error('Invalid destination folder path');
+  }
+
+  const repositoryName = parseRepositoryName(repoUrl);
+  if (!repositoryName) {
+    throw new Error('Unable to determine repository name from URL');
+  }
+
+  await fs.mkdir(destinationDirectory, { recursive: true });
+
+  const destinationStat = await fs.stat(destinationDirectory);
+  if (!destinationStat.isDirectory()) {
+    throw new Error('Destination path must be a directory');
+  }
+
+  const clonedProjectPath = path.join(destinationDirectory, repositoryName);
+  try {
+    await fs.access(clonedProjectPath);
+    throw new Error('A folder with this repository name already exists in destination');
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  await runCommand('git', ['clone', repoUrl, repositoryName], destinationDirectory);
+  await fs.mkdir(path.join(clonedProjectPath, '.bore'), { recursive: true });
+  return clonedProjectPath;
+});
+
+ipcMain.handle('project:read-layout', async (_event, projectRoot) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  const layoutPath = getBoreLayoutPath(projectRoot);
+  try {
+    const raw = await fs.readFile(layoutPath, 'utf8');
+    return JSON.parse(raw);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+});
+
+ipcMain.handle('project:save-layout', async (_event, projectRoot, layoutState) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  if (!layoutState || typeof layoutState !== 'object') {
+    throw new Error('Invalid layout payload');
+  }
+
+  const boreFolder = path.join(projectRoot, '.bore');
+  await fs.mkdir(boreFolder, { recursive: true });
+  const layoutPath = getBoreLayoutPath(projectRoot);
+  await fs.writeFile(layoutPath, `${JSON.stringify(layoutState, null, 2)}\n`, 'utf8');
+  return true;
+});
+
+ipcMain.handle('project:get-recent', async () => {
+  return readRecentProjects();
+});
+
+ipcMain.handle('settings:get', async () => {
+  return readSettings();
+});
+
+ipcMain.handle('settings:save', async (_event, payload) => {
+  const normalized = normalizeSettingsPayload(payload);
+  await writeSettings(normalized);
+  return normalized;
 });
 
 ipcMain.handle('fs:readdir', async (_event, directoryPath) => {

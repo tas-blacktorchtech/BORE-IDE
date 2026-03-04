@@ -37,11 +37,45 @@ type TerminalCreateResult = {
 }
 
 type PanelId = PanelVisibilityEvent['panelId']
+type DockPosition = 'left' | 'right' | 'bottom' | 'center'
+
+type SavedPanelLayout = {
+  mode: 'dock' | 'float'
+  dockPosition: DockPosition
+  x: number
+  y: number
+  width: number
+  height: number
+  z: number
+  collapsed: boolean
+}
+
+type ProjectLayoutPayload = {
+  version: 1
+  panelLayouts: Record<PanelId, SavedPanelLayout>
+  panelVisibility: Record<PanelId, boolean>
+}
+
+type CommandLineAlias = {
+  keyword: string
+  target: 'editor' | 'explorer' | 'terminal'
+}
+
+type AppSettings = {
+  commandLineAliases: CommandLineAlias[]
+}
 
 declare global {
   interface Window {
     ide: {
       openProjectDirectory: () => Promise<string | null>
+      prepareProjectFolder: (folderPath: string) => Promise<string>
+      cloneRepository: (repoUrl: string, destinationDirectory: string) => Promise<string>
+      getRecentProjects: () => Promise<string[]>
+      getSettings: () => Promise<AppSettings>
+      saveSettings: (settings: AppSettings) => Promise<AppSettings>
+      readProjectLayout: (projectRoot: string) => Promise<ProjectLayoutPayload | null>
+      saveProjectLayout: (projectRoot: string, layoutState: ProjectLayoutPayload) => Promise<boolean>
       setPanelVisibility: (
         panelId: PanelId,
         visible: boolean,
@@ -54,6 +88,9 @@ declare global {
       resizeTerminal: (terminalId: string, cols: number, rows: number) => void
       closeTerminal: (terminalId: string) => void
       onPanelVisibilityChange: (callback: (payload: PanelVisibilityEvent) => void) => () => void
+      onSaveLayoutRequest: (callback: () => void) => () => void
+      onToggleCommandLine: (callback: () => void) => () => void
+      onCloseProjectRequest: (callback: () => void) => () => void
       onTerminalData: (
         terminalId: string,
         callback: (payload: TerminalDataEvent) => void,

@@ -1,434 +1,38 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import Editor from '@monaco-editor/react'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import { ChevronDown, X } from 'lucide-react'
+import { CommandLinePanel } from './components/CommandLinePanel'
+import { HelpPanel } from './components/HelpPanel'
+import { OptionsModal } from './components/OptionsModal'
+import type { CommandAlias, CommandAliasTarget } from './components/OptionsModal'
+import { PanelChrome } from './components/PanelChrome'
+import { StartupScreen } from './components/StartupScreen'
+import { TerminalView } from './components/TerminalView'
+import {
+  DEFAULT_PANEL_VISIBILITY,
+  cloneDefaultPanelLayouts,
+  detectLanguage,
+  normalizePersistedLayout,
+  patchNode,
+} from './types/workbench'
+import type {
+  DockPosition,
+  FileNode,
+  OpenTab,
+  PanelId,
+  PanelLayout,
+  PanelVisibility,
+  PersistedLayout,
+  ResizeDirection,
+  TerminalSession,
+} from './types/workbench'
 import '@xterm/xterm/css/xterm.css'
 import './App.css'
 
-type EntryType = 'file' | 'directory'
-type PanelId = 'explorer' | 'editor' | 'bottom'
-type DockPosition = 'left' | 'right' | 'bottom' | 'center'
-type ResizeDirection = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
-
-type FileNode = {
-  name: string
-  path: string
-  type: EntryType
-  loaded?: boolean
-  children?: FileNode[]
-}
-
-type OpenTab = {
-  path: string
-  name: string
-  content: string
-  language: string
-  dirty: boolean
-}
-
-type TerminalSession = {
-  id: string
-  title: string
-  alive: boolean
-  mode: 'pty' | 'pipe'
-}
-
-type PanelLayout = {
-  mode: 'dock' | 'float'
-  dockPosition: DockPosition
-  x: number
-  y: number
-  width: number
-  height: number
-  z: number
-}
-
-type PanelVisibility = Record<PanelId, boolean>
-
-const PANEL_TITLES: Record<PanelId, string> = {
-  explorer: 'Explorer',
-  editor: 'Editor',
-  bottom: 'Terminal / Problems',
-}
-
-function detectLanguage(fileName: string): string {
-  const ext = fileName.split('.').pop()?.toLowerCase()
-
-  switch (ext) {
-    case 'ts':
-    case 'tsx':
-      return 'typescript'
-    case 'js':
-    case 'jsx':
-      return 'javascript'
-    case 'json':
-      return 'json'
-    case 'py':
-      return 'python'
-    case 'md':
-      return 'markdown'
-    case 'css':
-      return 'css'
-    case 'html':
-      return 'html'
-    case 'yml':
-    case 'yaml':
-      return 'yaml'
-    case 'sh':
-      return 'shell'
-    default:
-      return 'plaintext'
-  }
-}
-
-function patchNode(nodes: FileNode[], targetPath: string, updater: (node: FileNode) => FileNode): FileNode[] {
-  return nodes.map((node) => {
-    if (node.path === targetPath) {
-      return updater(node)
-    }
-
-    if (node.children) {
-      return {
-        ...node,
-        children: patchNode(node.children, targetPath, updater),
-      }
-    }
-
-    return node
-  })
-}
-
-type TerminalViewProps = {
-  terminalId: string
-  mode: 'pty' | 'pipe'
-  initialBuffer: string
-  active: boolean
-  onInput: (terminalId: string, value: string) => void
-  onResize: (terminalId: string, cols: number, rows: number) => void
-}
-
-function TerminalView({ terminalId, mode, initialBuffer, active, onInput, onResize }: TerminalViewProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null)
-  const terminalRef = useRef<Terminal | null>(null)
-  const fitAddonRef = useRef<FitAddon | null>(null)
-  const lineBufferRef = useRef('')
-  const initialBufferRef = useRef(initialBuffer)
-
-  useEffect(() => {
-    if (!containerRef.current) {
-      return
-    }
-
-    const terminal = new Terminal({
-      fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace',
-      fontSize: 12,
-      lineHeight: 1.45,
-      cursorBlink: true,
-      theme: {
-        background: '#101318',
-        foreground: '#e5e7eb',
-      },
-    })
-
-    const fitAddon = new FitAddon()
-    terminal.loadAddon(fitAddon)
-    terminal.open(containerRef.current)
-    fitAddon.fit()
-    if (initialBufferRef.current.length > 0) {
-      terminal.write(initialBufferRef.current)
-    }
-    onResize(terminalId, terminal.cols, terminal.rows)
-
-    terminal.onData((value) => {
-      if (mode === 'pty') {
-        onInput(terminalId, value)
-        return
-      }
-
-      for (const character of value) {
-        if (character === '\r') {
-          terminal.write('\r\n')
-          onInput(terminalId, `${lineBufferRef.current}\n`)
-          lineBufferRef.current = ''
-          continue
-        }
-
-        if (character === '\u007f') {
-          if (lineBufferRef.current.length > 0) {
-            lineBufferRef.current = lineBufferRef.current.slice(0, -1)
-            terminal.write('\b \b')
-          }
-          continue
-        }
-
-        if (character === '\u0003') {
-          lineBufferRef.current = ''
-          terminal.write('^C\r\n')
-          onInput(terminalId, '\u0003')
-          continue
-        }
-
-        lineBufferRef.current += character
-        terminal.write(character)
-      }
-    })
-    terminal.onResize((size) => onResize(terminalId, size.cols, size.rows))
-
-    terminalRef.current = terminal
-    fitAddonRef.current = fitAddon
-
-    const unsubscribeData = window.ide.onTerminalData(terminalId, (payload) => {
-      terminal.write(payload.data)
-    })
-
-    const unsubscribeExit = window.ide.onTerminalExit(terminalId, (payload) => {
-      terminal.writeln(`\r\n[process exited: ${payload.exitCode ?? 'unknown'}]`)
-    })
-
-    const observer = new ResizeObserver(() => {
-      fitAddon.fit()
-      onResize(terminalId, terminal.cols, terminal.rows)
-    })
-    observer.observe(containerRef.current)
-
-    return () => {
-      observer.disconnect()
-      unsubscribeData()
-      unsubscribeExit()
-      terminal.dispose()
-    }
-  }, [mode, onInput, onResize, terminalId])
-
-  useEffect(() => {
-    if (!active || !fitAddonRef.current) {
-      return
-    }
-
-    const rafId = window.requestAnimationFrame(() => {
-      fitAddonRef.current?.fit()
-      if (terminalRef.current) {
-        onResize(terminalId, terminalRef.current.cols, terminalRef.current.rows)
-      }
-      terminalRef.current?.focus()
-    })
-
-    return () => window.cancelAnimationFrame(rafId)
-  }, [active, onResize, terminalId])
-
-  return <div className={`terminal-view ${active ? 'active' : 'hidden'}`} ref={containerRef} />
-}
-
-type PanelChromeProps = {
-  panelId: PanelId
-  layout: PanelLayout
-  onFloat: (panelId: PanelId) => void
-  onDock: (panelId: PanelId, position: DockPosition) => void
-  onDragStart: (panelId: PanelId, event: ReactMouseEvent<HTMLElement>) => void
-  onResizeStart: (
-    panelId: PanelId,
-    direction: ResizeDirection,
-    event: ReactMouseEvent<HTMLDivElement>,
-  ) => void
-  onHide: (panelId: PanelId) => void
-  onFocus: (panelId: PanelId) => void
-  children: ReactNode
-}
-
-function PanelChrome({
-  panelId,
-  layout,
-  onFloat,
-  onDock,
-  onDragStart,
-  onResizeStart,
-  onHide,
-  onFocus,
-  children,
-}: PanelChromeProps) {
-  const [menuOpen, setMenuOpen] = useState(false)
-  const actionsRef = useRef<HTMLDivElement | null>(null)
-
-  useEffect(() => {
-    if (!menuOpen) {
-      return
-    }
-
-    const onPointerDown = (event: MouseEvent) => {
-      const target = event.target as Node
-      if (!actionsRef.current?.contains(target)) {
-        setMenuOpen(false)
-      }
-    }
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setMenuOpen(false)
-      }
-    }
-
-    window.addEventListener('mousedown', onPointerDown)
-    window.addEventListener('keydown', onKeyDown)
-
-    return () => {
-      window.removeEventListener('mousedown', onPointerDown)
-      window.removeEventListener('keydown', onKeyDown)
-    }
-  }, [menuOpen])
-
-  return (
-    <section
-      className={`panel-window ${layout.mode === 'float' ? 'floating' : 'docked'}`}
-      style={
-        layout.mode === 'float'
-          ? {
-              left: `${layout.x}px`,
-              top: `${layout.y}px`,
-              width: `${layout.width}px`,
-              height: `${layout.height}px`,
-              zIndex: layout.z,
-            }
-          : undefined
-      }
-      onMouseDown={() => onFocus(panelId)}
-    >
-      <header
-        className={`panel-window-header ${layout.mode === 'float' ? 'drag-handle' : ''}`}
-        onMouseDown={(event) => {
-          if (layout.mode !== 'float') {
-            return
-          }
-
-          const target = event.target as HTMLElement
-          if (target.closest('.panel-window-actions')) {
-            return
-          }
-
-          onDragStart(panelId, event)
-        }}
-      >
-        <div className="panel-window-title">
-          {PANEL_TITLES[panelId]}
-        </div>
-        <div className="panel-window-actions" ref={actionsRef}>
-          <button
-            className="panel-menu-trigger"
-            onClick={(event) => {
-              event.stopPropagation()
-              setMenuOpen((value) => !value)
-            }}
-            aria-label="Panel actions"
-          >
-            <ChevronDown size={14} />
-          </button>
-          {menuOpen && (
-            <div className="panel-menu-dropdown">
-              {layout.mode === 'float' ? (
-                <button
-                  onClick={() => {
-                    onDock(panelId, 'center')
-                    setMenuOpen(false)
-                  }}
-                >
-                  Dock
-                </button>
-              ) : (
-                <button
-                  onClick={() => {
-                    onFloat(panelId)
-                    setMenuOpen(false)
-                  }}
-                >
-                  Float
-                </button>
-              )}
-              <button
-                onClick={() => {
-                  onDock(panelId, 'left')
-                  setMenuOpen(false)
-                }}
-              >
-                Dock Left
-              </button>
-              <button
-                onClick={() => {
-                  onDock(panelId, 'right')
-                  setMenuOpen(false)
-                }}
-              >
-                Dock Right
-              </button>
-              <button
-                onClick={() => {
-                  onDock(panelId, 'bottom')
-                  setMenuOpen(false)
-                }}
-              >
-                Dock Bottom
-              </button>
-              <button
-                onClick={() => {
-                  onDock(panelId, 'center')
-                  setMenuOpen(false)
-                }}
-              >
-                Dock Center
-              </button>
-            </div>
-          )}
-          <button
-            className="panel-close-btn"
-            onClick={() => {
-              setMenuOpen(false)
-              onHide(panelId)
-            }}
-            aria-label={`Close ${PANEL_TITLES[panelId]} panel`}
-          >
-            <X size={14} />
-          </button>
-        </div>
-      </header>
-      <div className="panel-window-content">{children}</div>
-      {layout.mode === 'float' && (
-        <>
-          <div
-            className="resize-handle n"
-            onMouseDown={(event) => onResizeStart(panelId, 'n', event)}
-          />
-          <div
-            className="resize-handle s"
-            onMouseDown={(event) => onResizeStart(panelId, 's', event)}
-          />
-          <div
-            className="resize-handle e"
-            onMouseDown={(event) => onResizeStart(panelId, 'e', event)}
-          />
-          <div
-            className="resize-handle w"
-            onMouseDown={(event) => onResizeStart(panelId, 'w', event)}
-          />
-          <div
-            className="resize-handle ne"
-            onMouseDown={(event) => onResizeStart(panelId, 'ne', event)}
-          />
-          <div
-            className="resize-handle nw"
-            onMouseDown={(event) => onResizeStart(panelId, 'nw', event)}
-          />
-          <div
-            className="resize-handle se"
-            onMouseDown={(event) => onResizeStart(panelId, 'se', event)}
-          />
-          <div
-            className="resize-handle sw"
-            onMouseDown={(event) => onResizeStart(panelId, 'sw', event)}
-          />
-        </>
-      )}
-    </section>
-  )
-}
+const COMMAND_LINE_WIDTH = 680
+const COMMAND_LINE_HEIGHT = 64
+const HELP_PANEL_WIDTH = 520
+const HELP_PANEL_HEIGHT = 320
 
 function App() {
   const isMac = navigator.platform.toLowerCase().includes('mac')
@@ -450,50 +54,54 @@ function App() {
     originWidth: number
     originHeight: number
   } | null>(null)
+  const commandLineDragRef = useRef<{
+    startX: number
+    startY: number
+    originX: number
+    originY: number
+  } | null>(null)
+  const helpDragRef = useRef<{
+    startX: number
+    startY: number
+    originX: number
+    originY: number
+  } | null>(null)
 
   const [projectRoot, setProjectRoot] = useState<string | null>(null)
+  const [startupMode, setStartupMode] = useState<'home' | 'clone'>('home')
+  const [cloneUrl, setCloneUrl] = useState('')
+  const [cloneDestination, setCloneDestination] = useState('')
+  const [startupError, setStartupError] = useState<string | null>(null)
+  const [startupBusy, setStartupBusy] = useState(false)
+  const [optionsOpen, setOptionsOpen] = useState(false)
+  const [optionsTab, setOptionsTab] = useState<'command-line'>('command-line')
+  const [optionsBusy, setOptionsBusy] = useState(false)
+  const [optionsError, setOptionsError] = useState<string | null>(null)
+  const [commandAliases, setCommandAliases] = useState<CommandAlias[]>([])
+  const [recentProjects, setRecentProjects] = useState<string[]>([])
   const [fileTree, setFileTree] = useState<FileNode[]>([])
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null)
   const [activeBottomView, setActiveBottomView] = useState<'terminal' | 'problems'>('terminal')
+  const [commandLineOpen, setCommandLineOpen] = useState(false)
+  const [commandLineInput, setCommandLineInput] = useState('')
+  const [helpOpen, setHelpOpen] = useState(false)
+  const [commandLineWindow, setCommandLineWindow] = useState({
+    x: 160,
+    y: 72,
+    z: 1400,
+  })
+  const [helpWindow, setHelpWindow] = useState({
+    x: 220,
+    y: 120,
+    z: 1390,
+  })
   const [terminals, setTerminals] = useState<TerminalSession[]>([])
   const [terminalBuffers, setTerminalBuffers] = useState<Record<string, string>>({})
   const [activeTerminalId, setActiveTerminalId] = useState<string | null>(null)
-  const [panelVisibility, setPanelVisibility] = useState<PanelVisibility>({
-    explorer: true,
-    editor: true,
-    bottom: true,
-  })
-  const [panelLayouts, setPanelLayouts] = useState<Record<PanelId, PanelLayout>>({
-    explorer: {
-      mode: 'dock',
-      dockPosition: 'left',
-      x: 24,
-      y: 24,
-      width: 340,
-      height: 520,
-      z: 10,
-    },
-    editor: {
-      mode: 'dock',
-      dockPosition: 'center',
-      x: 140,
-      y: 78,
-      width: 860,
-      height: 560,
-      z: 11,
-    },
-    bottom: {
-      mode: 'dock',
-      dockPosition: 'bottom',
-      x: 220,
-      y: 180,
-      width: 820,
-      height: 260,
-      z: 12,
-    },
-  })
+  const [panelVisibility, setPanelVisibility] = useState<PanelVisibility>({ ...DEFAULT_PANEL_VISIBILITY })
+  const [panelLayouts, setPanelLayouts] = useState<Record<PanelId, PanelLayout>>(cloneDefaultPanelLayouts())
   const panelLayoutsRef = useRef(panelLayouts)
   const zCounterRef = useRef(30)
 
@@ -522,6 +130,68 @@ function App() {
         z: nextZ,
       },
     }))
+  }, [])
+
+  const bringCommandLineToFront = useCallback(() => {
+    const nextZ = ++zCounterRef.current
+    setCommandLineWindow((previous) => ({
+      ...previous,
+      z: nextZ,
+    }))
+  }, [])
+
+  const openCommandLine = useCallback(() => {
+    const nextZ = ++zCounterRef.current
+    if (workspaceRef.current) {
+      const bounds = workspaceRef.current.getBoundingClientRect()
+      const width = COMMAND_LINE_WIDTH
+      const height = COMMAND_LINE_HEIGHT
+      const x = Math.max(12, Math.floor((bounds.width - width) / 2))
+      const y = Math.max(12, bounds.height - height - 18)
+      setCommandLineWindow((previous) => ({
+        ...previous,
+        x,
+        y,
+        z: nextZ,
+      }))
+    } else {
+      setCommandLineWindow((previous) => ({
+        ...previous,
+        z: nextZ,
+      }))
+    }
+
+    setCommandLineOpen(true)
+  }, [])
+
+  const bringHelpToFront = useCallback(() => {
+    const nextZ = ++zCounterRef.current
+    setHelpWindow((previous) => ({
+      ...previous,
+      z: nextZ,
+    }))
+  }, [])
+
+  const openHelpWindow = useCallback(() => {
+    const nextZ = ++zCounterRef.current
+    if (workspaceRef.current) {
+      const bounds = workspaceRef.current.getBoundingClientRect()
+      const x = Math.max(12, Math.floor((bounds.width - HELP_PANEL_WIDTH) / 2))
+      const y = Math.max(12, Math.floor((bounds.height - HELP_PANEL_HEIGHT) / 2))
+      setHelpWindow((previous) => ({
+        ...previous,
+        x,
+        y,
+        z: nextZ,
+      }))
+    } else {
+      setHelpWindow((previous) => ({
+        ...previous,
+        z: nextZ,
+      }))
+    }
+
+    setHelpOpen(true)
   }, [])
 
   const dockPanel = useCallback((panelId: PanelId, position: DockPosition) => {
@@ -560,12 +230,23 @@ function App() {
         [panelId]: {
           ...current,
           mode: 'float',
+          collapsed: false,
           x: current.x + 26,
           y: current.y + 22,
           z: nextZ,
         },
       }
     })
+  }, [])
+
+  const toggleCollapse = useCallback((panelId: PanelId) => {
+    setPanelLayouts((previous) => ({
+      ...previous,
+      [panelId]: {
+        ...previous[panelId],
+        collapsed: !previous[panelId].collapsed,
+      },
+    }))
   }, [])
 
   const handleDragStart = (panelId: PanelId, event: ReactMouseEvent<HTMLElement>) => {
@@ -711,6 +392,76 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    const onMove = (event: MouseEvent) => {
+      const dragState = commandLineDragRef.current
+      if (!dragState || !workspaceRef.current) {
+        return
+      }
+
+      const workspaceRect = workspaceRef.current.getBoundingClientRect()
+      setCommandLineWindow((previous) => {
+        const rawX = dragState.originX + (event.clientX - dragState.startX)
+        const rawY = dragState.originY + (event.clientY - dragState.startY)
+        const maxX = Math.max(0, workspaceRect.width - COMMAND_LINE_WIDTH)
+        const maxY = Math.max(0, workspaceRect.height - COMMAND_LINE_HEIGHT)
+
+        return {
+          ...previous,
+          x: Math.min(Math.max(0, rawX), maxX),
+          y: Math.min(Math.max(0, rawY), maxY),
+        }
+      })
+    }
+
+    const onUp = () => {
+      commandLineDragRef.current = null
+    }
+
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+  }, [])
+
+  useEffect(() => {
+    const onMove = (event: MouseEvent) => {
+      const dragState = helpDragRef.current
+      if (!dragState || !workspaceRef.current) {
+        return
+      }
+
+      const workspaceRect = workspaceRef.current.getBoundingClientRect()
+      setHelpWindow((previous) => {
+        const rawX = dragState.originX + (event.clientX - dragState.startX)
+        const rawY = dragState.originY + (event.clientY - dragState.startY)
+        const maxX = Math.max(0, workspaceRect.width - HELP_PANEL_WIDTH)
+        const maxY = Math.max(0, workspaceRect.height - HELP_PANEL_HEIGHT)
+
+        return {
+          ...previous,
+          x: Math.min(Math.max(0, rawX), maxX),
+          y: Math.min(Math.max(0, rawY), maxY),
+        }
+      })
+    }
+
+    const onUp = () => {
+      helpDragRef.current = null
+    }
+
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+  }, [])
+
   const loadDirectory = useCallback(async (directoryPath: string): Promise<FileNode[]> => {
     const entries = await window.ide.readDirectory(directoryPath)
     return entries.map((entry) => ({
@@ -718,6 +469,81 @@ function App() {
       loaded: entry.type === 'file',
     }))
   }, [])
+
+  const normalizeAliasList = (aliases: CommandAlias[]): CommandAlias[] => {
+    const seen = new Set<string>()
+    const next: CommandAlias[] = []
+    for (const alias of aliases) {
+      const keyword = alias.keyword.trim().toLowerCase()
+      if (!keyword || keyword.length > 32 || seen.has(keyword)) {
+        continue
+      }
+      if (alias.target !== 'editor' && alias.target !== 'explorer' && alias.target !== 'terminal') {
+        continue
+      }
+      seen.add(keyword)
+      next.push({ keyword, target: alias.target })
+    }
+    return next
+  }
+
+  const loadSettings = useCallback(async () => {
+    const settings = await window.ide.getSettings()
+    setCommandAliases(normalizeAliasList(settings.commandLineAliases as CommandAlias[]))
+  }, [])
+
+  const saveSettings = useCallback(async () => {
+    const normalized = normalizeAliasList(commandAliases)
+    setOptionsBusy(true)
+    setOptionsError(null)
+    try {
+      const saved = await window.ide.saveSettings({ commandLineAliases: normalized })
+      setCommandAliases(normalizeAliasList(saved.commandLineAliases as CommandAlias[]))
+      setOptionsOpen(false)
+    } catch (error) {
+      setOptionsError(error instanceof Error ? error.message : 'Failed to save options')
+    } finally {
+      setOptionsBusy(false)
+    }
+  }, [commandAliases])
+
+  const refreshRecentProjects = useCallback(async () => {
+    const projects = await window.ide.getRecentProjects()
+    setRecentProjects(projects.slice(0, 5))
+  }, [])
+
+  const initializeProject = useCallback(
+    async (folderPath: string) => {
+      const preparedPath = await window.ide.prepareProjectFolder(folderPath)
+      const persistedLayout = normalizePersistedLayout(await window.ide.readProjectLayout(preparedPath))
+      const layouts = persistedLayout?.panelLayouts ?? cloneDefaultPanelLayouts()
+      const visibility = persistedLayout?.panelVisibility ?? { ...DEFAULT_PANEL_VISIBILITY }
+
+      const rootItems = await loadDirectory(preparedPath)
+      const maxZ = Math.max(layouts.explorer.z, layouts.editor.z, layouts.bottom.z, 30)
+      zCounterRef.current = maxZ
+
+      setProjectRoot(preparedPath)
+      setFileTree(rootItems)
+      setPanelLayouts(layouts)
+      setPanelVisibility(visibility)
+      setExpandedPaths(new Set())
+      setOpenTabs([])
+      setActiveTabPath(null)
+      setStartupError(null)
+      await refreshRecentProjects()
+    },
+    [loadDirectory, refreshRecentProjects],
+  )
+
+  const pickDirectoryForClone = async () => {
+    const selectedPath = await window.ide.openProjectDirectory()
+    if (!selectedPath) {
+      return
+    }
+
+    setCloneDestination(selectedPath)
+  }
 
   const openProject = useCallback(async () => {
     if (hasDirtyTabs) {
@@ -732,13 +558,55 @@ function App() {
       return
     }
 
-    const rootItems = await loadDirectory(selectedPath)
-    setProjectRoot(selectedPath)
-    setFileTree(rootItems)
-    setExpandedPaths(new Set())
-    setOpenTabs([])
-    setActiveTabPath(null)
-  }, [hasDirtyTabs, loadDirectory])
+    await initializeProject(selectedPath)
+  }, [hasDirtyTabs, initializeProject])
+
+  const cloneProject = async () => {
+    if (!cloneUrl.trim() || !cloneDestination.trim()) {
+      setStartupError('Repository URL and destination folder are required.')
+      return
+    }
+
+    try {
+      setStartupBusy(true)
+      setStartupError(null)
+      const clonedPath = await window.ide.cloneRepository(cloneUrl.trim(), cloneDestination.trim())
+      await initializeProject(clonedPath)
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : 'Failed to clone repository.')
+    } finally {
+      setStartupBusy(false)
+    }
+  }
+
+  const openExistingFolderFromStartup = async () => {
+    try {
+      setStartupBusy(true)
+      setStartupError(null)
+      const selectedPath = await window.ide.openProjectDirectory()
+      if (!selectedPath) {
+        return
+      }
+
+      await initializeProject(selectedPath)
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : 'Failed to open folder.')
+    } finally {
+      setStartupBusy(false)
+    }
+  }
+
+  const openRecentProject = async (projectPath: string) => {
+    try {
+      setStartupBusy(true)
+      setStartupError(null)
+      await initializeProject(projectPath)
+    } catch (error) {
+      setStartupError(error instanceof Error ? error.message : 'Failed to open recent project.')
+    } finally {
+      setStartupBusy(false)
+    }
+  }
 
   const toggleFolder = useCallback(
     async (node: FileNode) => {
@@ -917,8 +785,101 @@ function App() {
     return () => unsubscribe()
   }, [])
 
+  const saveCurrentLayout = useCallback(async () => {
+    if (!projectRoot) {
+      return
+    }
+
+    const payload: PersistedLayout = {
+      version: 1,
+      panelLayouts: panelLayoutsRef.current,
+      panelVisibility,
+    }
+
+    await window.ide.saveProjectLayout(projectRoot, payload)
+  }, [panelVisibility, projectRoot])
+
+  const closeProject = useCallback(() => {
+    if (!projectRoot) {
+      return
+    }
+
+    if (hasDirtyTabs) {
+      const proceed = window.confirm('You have unsaved changes. Close project and discard them?')
+      if (!proceed) {
+        return
+      }
+    }
+
+    for (const session of terminals) {
+      window.ide.closeTerminal(session.id)
+    }
+
+    setProjectRoot(null)
+    setStartupMode('home')
+    setStartupError(null)
+    setStartupBusy(false)
+    setOptionsOpen(false)
+    setOptionsError(null)
+    setFileTree([])
+    setExpandedPaths(new Set())
+    setOpenTabs([])
+    setActiveTabPath(null)
+    setCommandLineInput('')
+    setCommandLineOpen(false)
+    setTerminals([])
+    setTerminalBuffers({})
+    setActiveTerminalId(null)
+  }, [hasDirtyTabs, projectRoot, terminals])
+
+  useEffect(() => {
+    const unsubscribe = window.ide.onSaveLayoutRequest(() => {
+      void saveCurrentLayout()
+    })
+
+    return () => unsubscribe()
+  }, [saveCurrentLayout])
+
+  useEffect(() => {
+    const unsubscribe = window.ide.onToggleCommandLine(() => {
+      if (commandLineOpen) {
+        setCommandLineOpen(false)
+      } else {
+        openCommandLine()
+      }
+    })
+
+    return () => unsubscribe()
+  }, [commandLineOpen, openCommandLine])
+
+  useEffect(() => {
+    const unsubscribe = window.ide.onCloseProjectRequest(() => {
+      closeProject()
+    })
+
+    return () => unsubscribe()
+  }, [closeProject])
+
+  useEffect(() => {
+    refreshRecentProjects().catch(() => {})
+  }, [refreshRecentProjects])
+
+  useEffect(() => {
+    loadSettings().catch(() => {})
+  }, [loadSettings])
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        if (commandLineOpen) {
+          setCommandLineOpen(false)
+        } else {
+          openCommandLine()
+        }
+        return
+      }
+
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
         event.preventDefault()
         saveActiveTab().catch(() => {})
@@ -927,7 +888,7 @@ function App() {
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [saveActiveTab])
+  }, [commandLineOpen, openCommandLine, saveActiveTab])
 
   const renderTreeNode = (node: FileNode, depth = 0) => {
     const isExpanded = expandedPaths.has(node.path)
@@ -1122,12 +1083,120 @@ function App() {
     .filter((panelId) => panelVisibility[panelId] && panelLayouts[panelId].mode === 'float')
     .sort((a, b) => panelLayouts[a].z - panelLayouts[b].z)
 
-  const hidePanel = useCallback((panelId: PanelId) => {
+  const setPanelOpenState = useCallback((panelId: PanelId, visible: boolean) => {
     setPanelVisibility((previous) => ({
       ...previous,
-      [panelId]: false,
+      [panelId]: visible,
     }))
-    window.ide.setPanelVisibility(panelId, false).catch(() => {})
+    window.ide.setPanelVisibility(panelId, visible).catch(() => {})
+  }, [])
+
+  const hidePanel = useCallback((panelId: PanelId) => {
+    setPanelOpenState(panelId, false)
+  }, [setPanelOpenState])
+
+  const resolvePanelFromToken = (token: string): PanelId | null => {
+    if (token === 'explorer') {
+      return 'explorer'
+    }
+    if (token === 'editor') {
+      return 'editor'
+    }
+    if (token === 'terminal' || token === 'bottom' || token === 'problems') {
+      return 'bottom'
+    }
+    return null
+  }
+
+  const resolveAliasTarget = (target: CommandAliasTarget): PanelId => {
+    if (target === 'terminal') {
+      return 'bottom'
+    }
+    return target
+  }
+
+  const runCommandLine = useCallback(() => {
+    const normalized = commandLineInput.trim().toLowerCase().replace(/\s+/g, ' ')
+    if (!normalized) {
+      return
+    }
+
+    if (normalized === 'help') {
+      openHelpWindow()
+      setCommandLineInput('')
+      return
+    }
+
+    if (normalized === 'close command line') {
+      setCommandLineOpen(false)
+      setCommandLineInput('')
+      return
+    }
+
+    const alias = commandAliases.find((entry) => entry.keyword === normalized)
+    if (alias) {
+      setPanelOpenState(resolveAliasTarget(alias.target), true)
+      setCommandLineInput('')
+      return
+    }
+
+    const [action, target] = normalized.split(' ')
+    const panel = resolvePanelFromToken(target ?? '')
+    if (panel && (action === 'open' || action === 'close' || action === 'toggle')) {
+      if (action === 'toggle') {
+        setPanelOpenState(panel, !panelVisibility[panel])
+      } else {
+        setPanelOpenState(panel, action === 'open')
+      }
+    }
+
+    setCommandLineInput('')
+  }, [commandAliases, commandLineInput, openHelpWindow, panelVisibility, setPanelOpenState])
+
+  const startCommandLineDrag = useCallback(
+    (event: ReactMouseEvent<HTMLElement>) => {
+      bringCommandLineToFront()
+      commandLineDragRef.current = {
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: commandLineWindow.x,
+        originY: commandLineWindow.y,
+      }
+    },
+    [bringCommandLineToFront, commandLineWindow.x, commandLineWindow.y],
+  )
+
+  const startHelpDrag = useCallback(
+    (event: ReactMouseEvent<HTMLElement>) => {
+      bringHelpToFront()
+      helpDragRef.current = {
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: helpWindow.x,
+        originY: helpWindow.y,
+      }
+    },
+    [bringHelpToFront, helpWindow.x, helpWindow.y],
+  )
+
+  const updateAliasKeyword = useCallback((index: number, value: string) => {
+    setCommandAliases((previous) =>
+      previous.map((entry, rowIndex) => (rowIndex === index ? { ...entry, keyword: value } : entry)),
+    )
+  }, [])
+
+  const updateAliasTarget = useCallback((index: number, value: CommandAliasTarget) => {
+    setCommandAliases((previous) =>
+      previous.map((entry, rowIndex) => (rowIndex === index ? { ...entry, target: value } : entry)),
+    )
+  }, [])
+
+  const removeAlias = useCallback((index: number) => {
+    setCommandAliases((previous) => previous.filter((_, rowIndex) => rowIndex !== index))
+  }, [])
+
+  const addAlias = useCallback(() => {
+    setCommandAliases((previous) => [...previous, { keyword: '', target: 'editor' }])
   }, [])
 
   return (
@@ -1146,6 +1215,63 @@ function App() {
         </aside>
 
         <div className="workbench" ref={workspaceRef}>
+          <CommandLinePanel
+            isOpen={commandLineOpen}
+            projectOpen={Boolean(projectRoot)}
+            value={commandLineInput}
+            windowState={commandLineWindow}
+            width={COMMAND_LINE_WIDTH}
+            height={COMMAND_LINE_HEIGHT}
+            onValueChange={setCommandLineInput}
+            onSubmit={runCommandLine}
+            onClose={() => setCommandLineOpen(false)}
+            onBringToFront={bringCommandLineToFront}
+            onDragStart={startCommandLineDrag}
+          />
+          <HelpPanel
+            isOpen={helpOpen}
+            width={HELP_PANEL_WIDTH}
+            height={HELP_PANEL_HEIGHT}
+            windowState={helpWindow}
+            onClose={() => setHelpOpen(false)}
+            onBringToFront={bringHelpToFront}
+            onDragStart={startHelpDrag}
+          />
+
+          <OptionsModal
+            isOpen={optionsOpen}
+            optionsTab={optionsTab}
+            commandAliases={commandAliases}
+            optionsBusy={optionsBusy}
+            optionsError={optionsError}
+            onClose={() => setOptionsOpen(false)}
+            onSetTab={setOptionsTab}
+            onKeywordChange={updateAliasKeyword}
+            onTargetChange={updateAliasTarget}
+            onRemoveAlias={removeAlias}
+            onAddAlias={addAlias}
+            onSave={() => void saveSettings()}
+          />
+
+          {!projectRoot ? (
+            <StartupScreen
+              mode={startupMode}
+              startupBusy={startupBusy}
+              startupError={startupError}
+              cloneUrl={cloneUrl}
+              cloneDestination={cloneDestination}
+              recentProjects={recentProjects}
+              onModeChange={setStartupMode}
+              onCloneUrlChange={setCloneUrl}
+              onCloneDestinationChange={setCloneDestination}
+              onOpenOptions={() => setOptionsOpen(true)}
+              onOpenFolder={() => void openExistingFolderFromStartup()}
+              onOpenRecent={(projectPath) => void openRecentProject(projectPath)}
+              onPickCloneDestination={() => void pickDirectoryForClone()}
+              onCloneProject={() => void cloneProject()}
+            />
+          ) : (
+            <>
           <div className="dock-layout">
             {dockedLeft && (
               <div className="dock-left">
@@ -1156,6 +1282,7 @@ function App() {
                   onDock={dockPanel}
                   onDragStart={handleDragStart}
                   onResizeStart={handleResizeStart}
+                  onToggleCollapse={toggleCollapse}
                   onHide={hidePanel}
                   onFocus={bringPanelToFront}
                 >
@@ -1174,6 +1301,7 @@ function App() {
                     onDock={dockPanel}
                     onDragStart={handleDragStart}
                     onResizeStart={handleResizeStart}
+                    onToggleCollapse={toggleCollapse}
                     onHide={hidePanel}
                     onFocus={bringPanelToFront}
                   >
@@ -1191,6 +1319,7 @@ function App() {
                     onDock={dockPanel}
                     onDragStart={handleDragStart}
                     onResizeStart={handleResizeStart}
+                    onToggleCollapse={toggleCollapse}
                     onHide={hidePanel}
                     onFocus={bringPanelToFront}
                   >
@@ -1209,6 +1338,7 @@ function App() {
                   onDock={dockPanel}
                   onDragStart={handleDragStart}
                   onResizeStart={handleResizeStart}
+                  onToggleCollapse={toggleCollapse}
                   onHide={hidePanel}
                   onFocus={bringPanelToFront}
                 >
@@ -1227,12 +1357,15 @@ function App() {
               onDock={dockPanel}
               onDragStart={handleDragStart}
               onResizeStart={handleResizeStart}
+              onToggleCollapse={toggleCollapse}
               onHide={hidePanel}
               onFocus={bringPanelToFront}
             >
               {panelContent[panelId]}
             </PanelChrome>
           ))}
+            </>
+          )}
         </div>
       </div>
     </div>
