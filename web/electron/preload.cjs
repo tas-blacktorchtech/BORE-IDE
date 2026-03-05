@@ -6,11 +6,23 @@ contextBridge.exposeInMainWorld('ide', {
   cloneRepository: (repoUrl, destinationDirectory) =>
     ipcRenderer.invoke('project:clone', repoUrl, destinationDirectory),
   getRecentProjects: () => ipcRenderer.invoke('project:get-recent'),
+  getGitGraph: (projectRoot, options) => ipcRenderer.invoke('git:get-graph', projectRoot, options),
+  getGitCommitStats: (projectRoot, commitId) =>
+    ipcRenderer.invoke('git:get-commit-stats', projectRoot, commitId),
+  getGitCommitDetails: (projectRoot, commitId) =>
+    ipcRenderer.invoke('git:get-commit-details', projectRoot, commitId),
+  createGitBranch: (projectRoot, payload) => ipcRenderer.invoke('git:create-branch', projectRoot, payload),
+  checkoutGitBranch: (projectRoot, payload) => ipcRenderer.invoke('git:checkout-branch', projectRoot, payload),
+  getGitBranchChanges: (projectRoot, branchName) =>
+    ipcRenderer.invoke('git:get-branch-changes', projectRoot, branchName),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
   readProjectLayout: (projectRoot) => ipcRenderer.invoke('project:read-layout', projectRoot),
   saveProjectLayout: (projectRoot, layoutState) =>
     ipcRenderer.invoke('project:save-layout', projectRoot, layoutState),
+  readProjectScratchpad: (projectRoot) => ipcRenderer.invoke('project:read-scratchpad', projectRoot),
+  saveProjectScratchpad: (projectRoot, document) =>
+    ipcRenderer.invoke('project:save-scratchpad', projectRoot, document),
   setPanelVisibility: (panelId, visible) => ipcRenderer.invoke('view:set-panel-visibility', panelId, visible),
   readDirectory: (directoryPath) => ipcRenderer.invoke('fs:readdir', directoryPath),
   readFile: (filePath) => ipcRenderer.invoke('fs:readFile', filePath),
@@ -33,6 +45,11 @@ contextBridge.exposeInMainWorld('ide', {
     const listener = () => callback();
     ipcRenderer.on('window:toggle-command-line', listener);
     return () => ipcRenderer.removeListener('window:toggle-command-line', listener);
+  },
+  onOpenOptionsRequest: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('window:open-options-request', listener);
+    return () => ipcRenderer.removeListener('window:open-options-request', listener);
   },
   onCloseProjectRequest: (callback) => {
     const listener = () => callback();

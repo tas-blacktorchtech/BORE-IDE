@@ -11,8 +11,11 @@ const viewVisibility = {
   explorer: true,
   editor: true,
   bottom: true,
+  scratch: false,
 };
 const BORE_LAYOUT_FILE = 'ide-layout.json';
+const BORE_SCRATCHPADS_DIR = 'scratchpads';
+const BORE_SCRATCHPAD_FILE = 'default.json';
 const RECENT_PROJECTS_FILE = 'recent-projects.json';
 const MAX_RECENT_PROJECTS = 5;
 const SETTINGS_FILE = 'settings.json';
@@ -101,8 +104,264 @@ function runCommand(command, args, cwd) {
   });
 }
 
+function runCommandCapture(command, args, cwd) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, {
+      cwd,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on('error', (error) => {
+      reject(error);
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+
+      reject(new Error(stderr.trim() || `${command} exited with code ${code}`));
+    });
+  });
+}
+
+function parseGitStatusSummary(rawStatus) {
+  let branch = 'detached';
+  let ahead = 0;
+  let behind = 0;
+  let dirtyCount = 0;
+
+  for (const line of rawStatus.split('\n')) {
+    if (!line) {
+      continue;
+    }
+
+    if (line.startsWith('# branch.head ')) {
+      const value = line.slice('# branch.head '.length).trim();
+      branch = value === '(detached)' ? 'detached' : value;
+      continue;
+    }
+
+    if (line.startsWith('# branch.ab ')) {
+      const value = line.slice('# branch.ab '.length).trim();
+      const parts = value.split(' ');
+      for (const part of parts) {
+        if (part.startsWith('+')) {
+          ahead = Number.parseInt(part.slice(1), 10) || 0;
+        }
+        if (part.startsWith('-')) {
+          behind = Number.parseInt(part.slice(1), 10) || 0;
+        }
+      }
+      continue;
+    }
+
+    if (!line.startsWith('#')) {
+      dirtyCount += 1;
+    }
+  }
+
+  return {
+    branch,
+    ahead,
+    behind,
+    dirtyCount,
+    clean: dirtyCount === 0,
+  };
+}
+
+function parseGitCommits(rawLog) {
+  if (!rawLog.trim()) {
+    return [];
+  }
+
+  const records = rawLog
+    .split('\x1e')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  return records.map((record) => {
+    const [id = '', parentField = '', message = '', author = '', authoredAt = '', decorations = ''] = record.split('\x1f');
+    const parents = parentField ? parentField.split(' ').filter(Boolean) : [];
+    const refs = decorations
+      .split(',')
+      .map((token) => token.trim())
+      .filter((token) => token && token !== 'HEAD');
+
+    const shortId = id.slice(0, 7);
+
+    return {
+      id,
+      shortId,
+      message,
+      author,
+      authoredAt,
+      parents,
+      refs: refs.slice(0, 3),
+      head: decorations.includes('HEAD ->'),
+    };
+  });
+}
+
+function parseGitCommitFiles(rawNameStatus) {
+  return rawNameStatus
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [statusRaw = '', ...rest] = line.split('\t');
+      const status = statusRaw.charAt(0) || 'M';
+      const pathValue = rest.at(-1) || '';
+      return {
+        status,
+        path: pathValue,
+      };
+    })
+    .filter((entry) => entry.path.length > 0);
+}
+
+function parseBranchList(rawBranches) {
+  return rawBranches
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((name) => !name.endsWith('/HEAD'))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function sanitizeBranchName(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim();
+}
+
+function isValidBranchName(value) {
+  const name = sanitizeBranchName(value);
+  if (!name) {
+    return false;
+  }
+  if (name.startsWith('-') || name.endsWith('.') || name.endsWith('/') || name.includes('..')) {
+    return false;
+  }
+  if (/[\s~^:?*[\]\\]/.test(name)) {
+    return false;
+  }
+  if (name.includes('@{') || name === '@') {
+    return false;
+  }
+  return true;
+}
+
+function parseNameStatusEntries(rawNameStatus) {
+  return rawNameStatus
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [statusRaw = '', ...parts] = line.split('\t');
+      const status = statusRaw.charAt(0) || 'M';
+      const pathValue = parts.at(-1) || '';
+      return {
+        status,
+        path: pathValue,
+      };
+    })
+    .filter((entry) => entry.path.length > 0);
+}
+
+function parseNumstatByPath(rawNumstat) {
+  const byPath = new Map();
+  let insertions = 0;
+  let deletions = 0;
+
+  for (const line of rawNumstat.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const [addedRaw = '', deletedRaw = '', pathValue = ''] = line.split('\t');
+    if (!pathValue) {
+      continue;
+    }
+
+    const added = /^\d+$/.test(addedRaw) ? Number.parseInt(addedRaw, 10) : 0;
+    const deleted = /^\d+$/.test(deletedRaw) ? Number.parseInt(deletedRaw, 10) : 0;
+    byPath.set(pathValue, { insertions: added, deletions: deleted });
+    insertions += added;
+    deletions += deleted;
+  }
+
+  return {
+    byPath,
+    insertions,
+    deletions,
+  };
+}
+
+async function resolveBranchChangesBase(projectRoot, branchName) {
+  try {
+    const upstream = (
+      await runCommandCapture(
+        'git',
+        ['for-each-ref', '--format=%(upstream:short)', `refs/heads/${branchName}`],
+        projectRoot,
+      )
+    )
+      .trim()
+      .split('\n')
+      .find(Boolean);
+    if (upstream) {
+      return upstream.trim();
+    }
+  } catch {
+    // Fallback to remote head / common default branches.
+  }
+
+  const candidates = [];
+  try {
+    const remoteHead = (
+      await runCommandCapture('git', ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], projectRoot)
+    ).trim();
+    if (remoteHead) {
+      candidates.push(remoteHead);
+    }
+  } catch {
+    // Ignore and continue.
+  }
+
+  candidates.push('origin/main', 'origin/master', 'main', 'master');
+  for (const ref of candidates) {
+    try {
+      await runCommandCapture('git', ['rev-parse', '--verify', '--quiet', ref], projectRoot);
+      return ref;
+    } catch {
+      // Try next ref.
+    }
+  }
+
+  return null;
+}
+
 function getBoreLayoutPath(projectRoot) {
   return path.join(projectRoot, '.bore', BORE_LAYOUT_FILE);
+}
+
+function getBoreScratchpadPath(projectRoot) {
+  return path.join(projectRoot, '.bore', BORE_SCRATCHPADS_DIR, BORE_SCRATCHPAD_FILE);
 }
 
 function getRecentProjectsPath() {
@@ -155,6 +414,25 @@ function normalizeSettingsPayload(payload) {
   return {
     commandLineAliases: normalizeCommandLineAliases(payload.commandLineAliases),
   };
+}
+
+function normalizeScratchPadDocument(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return {
+      title: '',
+      html: '',
+      updatedAt: new Date(0).toISOString(),
+    };
+  }
+
+  const title = typeof payload.title === 'string' ? payload.title.slice(0, 120) : '';
+  const html = typeof payload.html === 'string' ? payload.html : '';
+  const updatedAtRaw = typeof payload.updatedAt === 'string' ? payload.updatedAt : '';
+  const updatedAt = Number.isNaN(Date.parse(updatedAtRaw))
+    ? new Date(0).toISOString()
+    : new Date(updatedAtRaw).toISOString();
+
+  return { title, html, updatedAt };
 }
 
 async function readSettings() {
@@ -353,6 +631,19 @@ function createApplicationMenu() {
       label: 'File',
       submenu: [
         {
+          label: 'Options',
+          accelerator: 'CmdOrCtrl+,',
+          click: () => {
+            const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+            if (!win) {
+              return;
+            }
+
+            win.webContents.send('window:open-options-request');
+          },
+        },
+        { type: 'separator' },
+        {
           label: 'Close Project',
           click: () => {
             const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
@@ -407,6 +698,15 @@ function createApplicationMenu() {
           checked: viewVisibility.bottom,
           click: (menuItem) => {
             setPanelVisibility('bottom', menuItem.checked);
+          },
+        },
+        {
+          id: 'view-panel-scratch',
+          label: 'Scratch Pad',
+          type: 'checkbox',
+          checked: viewVisibility.scratch,
+          click: (menuItem) => {
+            setPanelVisibility('scratch', menuItem.checked);
           },
         },
         { type: 'separator' },
@@ -576,6 +876,35 @@ ipcMain.handle('project:save-layout', async (_event, projectRoot, layoutState) =
   return true;
 });
 
+ipcMain.handle('project:read-scratchpad', async (_event, projectRoot) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  const scratchpadPath = getBoreScratchpadPath(projectRoot);
+  try {
+    const raw = await fs.readFile(scratchpadPath, 'utf8');
+    return normalizeScratchPadDocument(JSON.parse(raw));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return normalizeScratchPadDocument(null);
+    }
+    throw error;
+  }
+});
+
+ipcMain.handle('project:save-scratchpad', async (_event, projectRoot, document) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  const normalizedDocument = normalizeScratchPadDocument(document);
+  const scratchpadPath = getBoreScratchpadPath(projectRoot);
+  await fs.mkdir(path.dirname(scratchpadPath), { recursive: true });
+  await fs.writeFile(scratchpadPath, `${JSON.stringify(normalizedDocument, null, 2)}\n`, 'utf8');
+  return normalizedDocument;
+});
+
 ipcMain.handle('project:get-recent', async () => {
   return readRecentProjects();
 });
@@ -588,6 +917,259 @@ ipcMain.handle('settings:save', async (_event, payload) => {
   const normalized = normalizeSettingsPayload(payload);
   await writeSettings(normalized);
   return normalized;
+});
+
+ipcMain.handle('git:get-graph', async (_event, projectRoot, options) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  const rawOffset = Number.parseInt(String(options?.offset ?? 0), 10);
+  const rawLimit = Number.parseInt(String(options?.limit ?? 20), 10);
+  const offset = Number.isInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 20;
+
+  try {
+    await runCommandCapture('git', ['rev-parse', '--is-inside-work-tree'], projectRoot);
+  } catch {
+    return {
+      ok: false,
+      error: 'Selected project is not a git repository.',
+      summary: {
+        branch: 'n/a',
+        ahead: 0,
+        behind: 0,
+        dirtyCount: 0,
+        clean: true,
+        localBranches: [],
+        remoteBranches: [],
+      },
+      commits: [],
+    };
+  }
+
+  const [rawStatus, rawLog, rawLocalBranches, rawRemoteBranches] = await Promise.all([
+    runCommandCapture('git', ['status', '--porcelain=2', '--branch'], projectRoot),
+    runCommandCapture(
+      'git',
+      [
+        'log',
+        '--all',
+        '--date-order',
+        `--skip=${offset}`,
+        `--max-count=${limit}`,
+        '--pretty=format:%H%x1f%P%x1f%s%x1f%an%x1f%cI%x1f%D%x1e',
+      ],
+      projectRoot,
+    ),
+    runCommandCapture('git', ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], projectRoot),
+    runCommandCapture('git', ['for-each-ref', '--format=%(refname:short)', 'refs/remotes'], projectRoot),
+  ]);
+
+  const commits = parseGitCommits(rawLog);
+  const statusSummary = parseGitStatusSummary(rawStatus);
+  return {
+    ok: true,
+    summary: {
+      ...statusSummary,
+      localBranches: parseBranchList(rawLocalBranches),
+      remoteBranches: parseBranchList(rawRemoteBranches),
+    },
+    commits,
+    offset,
+    limit,
+    hasMore: commits.length === limit,
+  };
+});
+
+ipcMain.handle('git:create-branch', async (_event, projectRoot, payload) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  const name = sanitizeBranchName(payload?.name);
+  const from = sanitizeBranchName(payload?.from);
+
+  if (!isValidBranchName(name)) {
+    throw new Error('Invalid branch name');
+  }
+
+  const args = ['branch', name];
+  if (from) {
+    args.push(from);
+  }
+  await runCommandCapture('git', args, projectRoot);
+  return {
+    ok: true,
+    name,
+    from: from || null,
+  };
+});
+
+ipcMain.handle('git:checkout-branch', async (_event, projectRoot, payload) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  const name = sanitizeBranchName(payload?.name);
+  if (!name) {
+    throw new Error('Branch name is required');
+  }
+
+  const rawLocal = await runCommandCapture(
+    'git',
+    ['for-each-ref', '--format=%(refname:short)', 'refs/heads'],
+    projectRoot,
+  );
+  const localBranches = new Set(parseBranchList(rawLocal));
+  if (localBranches.has(name)) {
+    await runCommandCapture('git', ['switch', name], projectRoot);
+    return { ok: true, checkedOut: name, created: false };
+  }
+
+  if (name.startsWith('origin/')) {
+    const localName = name.slice('origin/'.length);
+    if (!isValidBranchName(localName)) {
+      throw new Error('Invalid tracking branch name');
+    }
+    if (localBranches.has(localName)) {
+      await runCommandCapture('git', ['switch', localName], projectRoot);
+      return { ok: true, checkedOut: localName, created: false };
+    }
+    await runCommandCapture('git', ['switch', '--track', '-c', localName, name], projectRoot);
+    return { ok: true, checkedOut: localName, created: true };
+  }
+
+  await runCommandCapture('git', ['switch', name], projectRoot);
+  return { ok: true, checkedOut: name, created: false };
+});
+
+ipcMain.handle('git:get-branch-changes', async (_event, projectRoot, branchNameRaw) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  const branchNameInput = sanitizeBranchName(branchNameRaw);
+  let branchName = branchNameInput;
+
+  if (!branchName) {
+    branchName = (await runCommandCapture('git', ['branch', '--show-current'], projectRoot)).trim();
+  }
+  if (!branchName) {
+    throw new Error('Unable to determine branch');
+  }
+
+  const baseRef = await resolveBranchChangesBase(projectRoot, branchName);
+  if (!baseRef) {
+    return {
+      ok: true,
+      branch: branchName,
+      base: null,
+      files: [],
+      summary: {
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+      },
+    };
+  }
+
+  const mergeBase = (await runCommandCapture('git', ['merge-base', baseRef, branchName], projectRoot)).trim();
+  const diffRange = `${mergeBase}...${branchName}`;
+
+  const [rawNameStatus, rawNumstat] = await Promise.all([
+    runCommandCapture('git', ['diff', '--name-status', diffRange], projectRoot),
+    runCommandCapture('git', ['diff', '--numstat', diffRange], projectRoot),
+  ]);
+
+  const statusEntries = parseNameStatusEntries(rawNameStatus);
+  const numstat = parseNumstatByPath(rawNumstat);
+  const files = statusEntries.map((entry) => {
+    const stats = numstat.byPath.get(entry.path) ?? { insertions: 0, deletions: 0 };
+    return {
+      status: entry.status,
+      path: entry.path,
+      insertions: stats.insertions,
+      deletions: stats.deletions,
+    };
+  });
+
+  return {
+    ok: true,
+    branch: branchName,
+    base: baseRef,
+    files,
+    summary: {
+      filesChanged: files.length,
+      insertions: numstat.insertions,
+      deletions: numstat.deletions,
+    },
+  };
+});
+
+ipcMain.handle('git:get-commit-stats', async (_event, projectRoot, commitId) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  if (typeof commitId !== 'string' || !/^[0-9a-f]{7,40}$/i.test(commitId)) {
+    throw new Error('Invalid commit id');
+  }
+
+  const rawNumstat = await runCommandCapture('git', ['show', '--numstat', '--format=', commitId], projectRoot);
+  let filesChanged = 0;
+  let insertions = 0;
+  let deletions = 0;
+
+  for (const line of rawNumstat.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const [addedRaw = '', deletedRaw = '', pathValue = ''] = line.split('\t');
+    if (!pathValue) {
+      continue;
+    }
+
+    filesChanged += 1;
+    if (/^\d+$/.test(addedRaw)) {
+      insertions += Number.parseInt(addedRaw, 10);
+    }
+    if (/^\d+$/.test(deletedRaw)) {
+      deletions += Number.parseInt(deletedRaw, 10);
+    }
+  }
+
+  return {
+    ok: true,
+    commitId,
+    filesChanged,
+    insertions,
+    deletions,
+  };
+});
+
+ipcMain.handle('git:get-commit-details', async (_event, projectRoot, commitId) => {
+  if (!isSafePathInput(projectRoot)) {
+    throw new Error('Invalid project root path');
+  }
+
+  if (typeof commitId !== 'string' || !/^[0-9a-f]{7,40}$/i.test(commitId)) {
+    throw new Error('Invalid commit id');
+  }
+
+  const [rawPatch, rawNameStatus] = await Promise.all([
+    runCommandCapture('git', ['show', '--patch', '--unified=3', '--no-color', '--format=', commitId], projectRoot),
+    runCommandCapture('git', ['show', '--name-status', '--format=', commitId], projectRoot),
+  ]);
+
+  return {
+    ok: true,
+    commitId,
+    files: parseGitCommitFiles(rawNameStatus),
+    patch: rawPatch,
+  };
 });
 
 ipcMain.handle('fs:readdir', async (_event, directoryPath) => {

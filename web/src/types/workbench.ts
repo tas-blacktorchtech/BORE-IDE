@@ -1,5 +1,5 @@
 export type EntryType = 'file' | 'directory'
-export type PanelId = 'explorer' | 'editor' | 'bottom'
+export type PanelId = 'explorer' | 'editor' | 'bottom' | 'git' | 'help' | 'scratch'
 export type DockPosition = 'left' | 'right' | 'bottom' | 'center'
 export type ResizeDirection = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
 
@@ -49,6 +49,9 @@ export const PANEL_TITLES: Record<PanelId, string> = {
   explorer: 'Explorer',
   editor: 'Editor',
   bottom: 'Terminal / Problems',
+  git: 'Git Command Center',
+  help: 'Help',
+  scratch: 'Scratch Pad',
 }
 
 const DEFAULT_PANEL_LAYOUTS: Record<PanelId, PanelLayout> = {
@@ -82,12 +85,45 @@ const DEFAULT_PANEL_LAYOUTS: Record<PanelId, PanelLayout> = {
     z: 12,
     collapsed: false,
   },
+  git: {
+    mode: 'float',
+    dockPosition: 'right',
+    x: 260,
+    y: 96,
+    width: 700,
+    height: 420,
+    z: 13,
+    collapsed: false,
+  },
+  help: {
+    mode: 'float',
+    dockPosition: 'right',
+    x: 220,
+    y: 120,
+    width: 520,
+    height: 320,
+    z: 14,
+    collapsed: false,
+  },
+  scratch: {
+    mode: 'float',
+    dockPosition: 'right',
+    x: 320,
+    y: 140,
+    width: 520,
+    height: 300,
+    z: 15,
+    collapsed: false,
+  },
 }
 
 export const DEFAULT_PANEL_VISIBILITY: PanelVisibility = {
   explorer: true,
   editor: true,
   bottom: true,
+  git: false,
+  help: false,
+  scratch: false,
 }
 
 export function cloneDefaultPanelLayouts(): Record<PanelId, PanelLayout> {
@@ -95,6 +131,9 @@ export function cloneDefaultPanelLayouts(): Record<PanelId, PanelLayout> {
     explorer: { ...DEFAULT_PANEL_LAYOUTS.explorer },
     editor: { ...DEFAULT_PANEL_LAYOUTS.editor },
     bottom: { ...DEFAULT_PANEL_LAYOUTS.bottom },
+    git: { ...DEFAULT_PANEL_LAYOUTS.git },
+    help: { ...DEFAULT_PANEL_LAYOUTS.help },
+    scratch: { ...DEFAULT_PANEL_LAYOUTS.scratch },
   }
 }
 
@@ -117,9 +156,12 @@ export function normalizePersistedLayout(payload: unknown): PersistedLayout | nu
     explorer: { ...defaultLayouts.explorer },
     editor: { ...defaultLayouts.editor },
     bottom: { ...defaultLayouts.bottom },
+    git: { ...defaultLayouts.git },
+    help: { ...defaultLayouts.help },
+    scratch: { ...defaultLayouts.scratch },
   }
 
-  for (const panelId of ['explorer', 'editor', 'bottom'] as PanelId[]) {
+  for (const panelId of ['explorer', 'editor', 'bottom', 'git', 'help', 'scratch'] as PanelId[]) {
     const raw = candidate.panelLayouts[panelId]
     if (!raw || typeof raw !== 'object') {
       continue
@@ -152,6 +194,9 @@ export function normalizePersistedLayout(payload: unknown): PersistedLayout | nu
     explorer: candidate.panelVisibility.explorer !== false,
     editor: candidate.panelVisibility.editor !== false,
     bottom: candidate.panelVisibility.bottom !== false,
+    git: candidate.panelVisibility.git === true,
+    help: candidate.panelVisibility.help === true,
+    scratch: candidate.panelVisibility.scratch === true,
   }
 
   return {

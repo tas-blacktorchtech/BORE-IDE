@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import Editor from '@monaco-editor/react'
 import { CommandLinePanel } from './components/CommandLinePanel'
-import { HelpPanel } from './components/HelpPanel'
+import { EditorCrashBoundary } from './components/EditorCrashBoundary'
+import { GitCommandCenter } from './components/GitCommandCenter'
 import { OptionsModal } from './components/OptionsModal'
 import type { CommandAlias, CommandAliasTarget } from './components/OptionsModal'
 import { PanelChrome } from './components/PanelChrome'
+import { ScratchPad } from './components/ScratchPad'
 import { StartupScreen } from './components/StartupScreen'
 import { TerminalView } from './components/TerminalView'
 import {
@@ -31,8 +33,7 @@ import './App.css'
 
 const COMMAND_LINE_WIDTH = 680
 const COMMAND_LINE_HEIGHT = 64
-const HELP_PANEL_WIDTH = 520
-const HELP_PANEL_HEIGHT = 320
+const REFRESH_PROJECT_KEY = 'bore.refreshProjectRoot'
 
 function App() {
   const isMac = navigator.platform.toLowerCase().includes('mac')
@@ -60,12 +61,6 @@ function App() {
     originX: number
     originY: number
   } | null>(null)
-  const helpDragRef = useRef<{
-    startX: number
-    startY: number
-    originX: number
-    originY: number
-  } | null>(null)
 
   const [projectRoot, setProjectRoot] = useState<string | null>(null)
   const [startupMode, setStartupMode] = useState<'home' | 'clone'>('home')
@@ -83,19 +78,15 @@ function App() {
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set())
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([])
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null)
+  const [editorNotice, setEditorNotice] = useState<string | null>(null)
+  const [editorResetVersion, setEditorResetVersion] = useState(0)
   const [activeBottomView, setActiveBottomView] = useState<'terminal' | 'problems'>('terminal')
   const [commandLineOpen, setCommandLineOpen] = useState(false)
   const [commandLineInput, setCommandLineInput] = useState('')
-  const [helpOpen, setHelpOpen] = useState(false)
   const [commandLineWindow, setCommandLineWindow] = useState({
     x: 160,
     y: 72,
     z: 1400,
-  })
-  const [helpWindow, setHelpWindow] = useState({
-    x: 220,
-    y: 120,
-    z: 1390,
   })
   const [terminals, setTerminals] = useState<TerminalSession[]>([])
   const [terminalBuffers, setTerminalBuffers] = useState<Record<string, string>>({})
@@ -116,10 +107,16 @@ function App() {
     window.ide.resizeTerminal(terminalId, cols, rows)
   }, [])
   const hasDirtyTabs = openTabs.some((tab) => tab.dirty)
+  const openTabsRef = useRef(openTabs)
+  const openingFilePathsRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     panelLayoutsRef.current = panelLayouts
   }, [panelLayouts])
+
+  useEffect(() => {
+    openTabsRef.current = openTabs
+  }, [openTabs])
 
   const bringPanelToFront = useCallback((panelId: PanelId) => {
     const nextZ = ++zCounterRef.current
@@ -164,43 +161,11 @@ function App() {
     setCommandLineOpen(true)
   }, [])
 
-  const bringHelpToFront = useCallback(() => {
-    const nextZ = ++zCounterRef.current
-    setHelpWindow((previous) => ({
-      ...previous,
-      z: nextZ,
-    }))
-  }, [])
-
-  const openHelpWindow = useCallback(() => {
-    const nextZ = ++zCounterRef.current
-    if (workspaceRef.current) {
-      const bounds = workspaceRef.current.getBoundingClientRect()
-      const x = Math.max(12, Math.floor((bounds.width - HELP_PANEL_WIDTH) / 2))
-      const y = Math.max(12, Math.floor((bounds.height - HELP_PANEL_HEIGHT) / 2))
-      setHelpWindow((previous) => ({
-        ...previous,
-        x,
-        y,
-        z: nextZ,
-      }))
-    } else {
-      setHelpWindow((previous) => ({
-        ...previous,
-        z: nextZ,
-      }))
-    }
-
-    setHelpOpen(true)
-  }, [])
-
   const dockPanel = useCallback((panelId: PanelId, position: DockPosition) => {
     setPanelLayouts((previous) => {
-      const next: Record<PanelId, PanelLayout> = {
-        explorer: { ...previous.explorer },
-        editor: { ...previous.editor },
-        bottom: { ...previous.bottom },
-      }
+      const next = Object.fromEntries(
+        (Object.keys(previous) as PanelId[]).map((id) => [id, { ...previous[id] }]),
+      ) as Record<PanelId, PanelLayout>
 
       ;(Object.keys(next) as PanelId[]).forEach((candidateId) => {
         if (candidateId !== panelId && next[candidateId].mode === 'dock' && next[candidateId].dockPosition === position) {
@@ -427,41 +392,6 @@ function App() {
     }
   }, [])
 
-  useEffect(() => {
-    const onMove = (event: MouseEvent) => {
-      const dragState = helpDragRef.current
-      if (!dragState || !workspaceRef.current) {
-        return
-      }
-
-      const workspaceRect = workspaceRef.current.getBoundingClientRect()
-      setHelpWindow((previous) => {
-        const rawX = dragState.originX + (event.clientX - dragState.startX)
-        const rawY = dragState.originY + (event.clientY - dragState.startY)
-        const maxX = Math.max(0, workspaceRect.width - HELP_PANEL_WIDTH)
-        const maxY = Math.max(0, workspaceRect.height - HELP_PANEL_HEIGHT)
-
-        return {
-          ...previous,
-          x: Math.min(Math.max(0, rawX), maxX),
-          y: Math.min(Math.max(0, rawY), maxY),
-        }
-      })
-    }
-
-    const onUp = () => {
-      helpDragRef.current = null
-    }
-
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
-
-    return () => {
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
-    }
-  }, [])
-
   const loadDirectory = useCallback(async (directoryPath: string): Promise<FileNode[]> => {
     const entries = await window.ide.readDirectory(directoryPath)
     return entries.map((entry) => ({
@@ -520,8 +450,9 @@ function App() {
       const visibility = persistedLayout?.panelVisibility ?? { ...DEFAULT_PANEL_VISIBILITY }
 
       const rootItems = await loadDirectory(preparedPath)
-      const maxZ = Math.max(layouts.explorer.z, layouts.editor.z, layouts.bottom.z, 30)
+      const maxZ = Math.max(...Object.values(layouts).map((layout) => layout.z), 30)
       zCounterRef.current = maxZ
+      sessionStorage.setItem(REFRESH_PROJECT_KEY, preparedPath)
 
       setProjectRoot(preparedPath)
       setFileTree(rootItems)
@@ -644,13 +575,52 @@ function App() {
         return
       }
 
-      const existing = openTabs.find((tab) => tab.path === node.path)
+      setPanelVisibility((previous) => ({
+        ...previous,
+        editor: true,
+      }))
+      window.ide.setPanelVisibility('editor', true).catch(() => {})
+      bringPanelToFront('editor')
+      setEditorNotice(null)
+
+      const existing = openTabsRef.current.find((tab) => tab.path === node.path)
       if (existing) {
-        setActiveTabPath(node.path)
+        if (activeTabPath !== node.path) {
+          setActiveTabPath(node.path)
+        } else {
+          // Recover boundary state when re-focusing an already active file.
+          setEditorResetVersion((value) => value + 1)
+        }
         return
       }
 
-      const content = await window.ide.readFile(node.path)
+      if (openingFilePathsRef.current.has(node.path)) {
+        return
+      }
+      openingFilePathsRef.current.add(node.path)
+
+      let content = ''
+      try {
+        content = await window.ide.readFile(node.path)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown read error'
+        setEditorNotice(`Unable to open ${node.name}: ${message}`)
+        openingFilePathsRef.current.delete(node.path)
+        return
+      }
+
+      if (content.includes('\u0000')) {
+        setEditorNotice(`Cannot open ${node.name}: binary files are not supported in editor yet.`)
+        openingFilePathsRef.current.delete(node.path)
+        return
+      }
+
+      if (content.length > 1_500_000) {
+        setEditorNotice(`Cannot open ${node.name}: file is too large for this editor view.`)
+        openingFilePathsRef.current.delete(node.path)
+        return
+      }
+
       const tab: OpenTab = {
         path: node.path,
         name: node.name,
@@ -659,10 +629,11 @@ function App() {
         dirty: false,
       }
 
-      setOpenTabs((prev) => [...prev, tab])
+      setOpenTabs((prev) => (prev.some((entry) => entry.path === tab.path) ? prev : [...prev, tab]))
       setActiveTabPath(node.path)
+      openingFilePathsRef.current.delete(node.path)
     },
-    [openTabs],
+    [activeTabPath, bringPanelToFront],
   )
 
   const updateActiveTabContent = (nextValue: string) => {
@@ -814,6 +785,7 @@ function App() {
     for (const session of terminals) {
       window.ide.closeTerminal(session.id)
     }
+    sessionStorage.removeItem(REFRESH_PROJECT_KEY)
 
     setProjectRoot(null)
     setStartupMode('home')
@@ -827,6 +799,8 @@ function App() {
     setActiveTabPath(null)
     setCommandLineInput('')
     setCommandLineOpen(false)
+    setPanelVisibility({ ...DEFAULT_PANEL_VISIBILITY })
+    setPanelLayouts(cloneDefaultPanelLayouts())
     setTerminals([])
     setTerminalBuffers({})
     setActiveTerminalId(null)
@@ -853,6 +827,15 @@ function App() {
   }, [commandLineOpen, openCommandLine])
 
   useEffect(() => {
+    const unsubscribe = window.ide.onOpenOptionsRequest(() => {
+      setOptionsOpen(true)
+      setOptionsError(null)
+    })
+
+    return () => unsubscribe()
+  }, [])
+
+  useEffect(() => {
     const unsubscribe = window.ide.onCloseProjectRequest(() => {
       closeProject()
     })
@@ -863,6 +846,23 @@ function App() {
   useEffect(() => {
     refreshRecentProjects().catch(() => {})
   }, [refreshRecentProjects])
+
+  useEffect(() => {
+    const refreshProjectPath = sessionStorage.getItem(REFRESH_PROJECT_KEY)
+    if (!refreshProjectPath) {
+      return
+    }
+
+    setStartupBusy(true)
+    setStartupError(null)
+    initializeProject(refreshProjectPath)
+      .catch(() => {
+        sessionStorage.removeItem(REFRESH_PROJECT_KEY)
+      })
+      .finally(() => {
+        setStartupBusy(false)
+      })
+  }, [initializeProject])
 
   useEffect(() => {
     loadSettings().catch(() => {})
@@ -957,26 +957,32 @@ function App() {
         </div>
       </header>
       <section className="editor-pane">
-        {activeTab ? (
-          <Editor
-            height="100%"
-            path={activeTab.path}
-            theme="vs-dark"
-            language={activeTab.language}
-            value={activeTab.content}
-            onChange={(value) => updateActiveTabContent(value ?? '')}
-            options={{
-              minimap: { enabled: true },
-              fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace',
-              fontSize: 14,
-              smoothScrolling: true,
-              tabSize: 2,
-              wordWrap: 'on',
-            }}
-          />
-        ) : (
-          <div className="empty-editor">Open a file to start editing</div>
-        )}
+        {editorNotice && <div className="editor-notice">{editorNotice}</div>}
+        <div className="editor-body">
+          {activeTab ? (
+            <EditorCrashBoundary resetKey={`${activeTab.path}:${editorResetVersion}`}>
+              <Editor
+                key={`${activeTab.path}:${editorResetVersion}`}
+                height="100%"
+                path={activeTab.path}
+                theme="vs-dark"
+                language={activeTab.language}
+                value={activeTab.content}
+                onChange={(value) => updateActiveTabContent(value ?? '')}
+                options={{
+                  minimap: { enabled: true },
+                  fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: 14,
+                  smoothScrolling: true,
+                  tabSize: 2,
+                  wordWrap: 'on',
+                }}
+              />
+            </EditorCrashBoundary>
+          ) : (
+            <div className="empty-editor">Open a file to start editing</div>
+          )}
+        </div>
       </section>
     </div>
   )
@@ -1052,6 +1058,9 @@ function App() {
     explorer: renderExplorer(),
     editor: renderEditor(),
     bottom: renderBottom(),
+    git: <GitCommandCenter projectRoot={projectRoot ?? ''} />,
+    help: <section className="help-content" />,
+    scratch: <ScratchPad projectRoot={projectRoot} />,
   }
 
   const dockedLeft = (Object.keys(panelLayouts) as PanelId[]).find(
@@ -1088,7 +1097,9 @@ function App() {
       ...previous,
       [panelId]: visible,
     }))
-    window.ide.setPanelVisibility(panelId, visible).catch(() => {})
+    if (panelId === 'explorer' || panelId === 'editor' || panelId === 'bottom' || panelId === 'scratch') {
+      window.ide.setPanelVisibility(panelId, visible).catch(() => {})
+    }
   }, [])
 
   const hidePanel = useCallback((panelId: PanelId) => {
@@ -1104,6 +1115,15 @@ function App() {
     }
     if (token === 'terminal' || token === 'bottom' || token === 'problems') {
       return 'bottom'
+    }
+    if (token === 'git') {
+      return 'git'
+    }
+    if (token === 'help') {
+      return 'help'
+    }
+    if (token === 'scratch' || token === 'scratchpad') {
+      return 'scratch'
     }
     return null
   }
@@ -1122,8 +1142,17 @@ function App() {
     }
 
     if (normalized === 'help') {
-      openHelpWindow()
+      setPanelOpenState('help', true)
+      bringPanelToFront('help')
       setCommandLineInput('')
+      return
+    }
+
+    if (normalized === 'ref') {
+      if (projectRoot) {
+        sessionStorage.setItem(REFRESH_PROJECT_KEY, projectRoot)
+      }
+      window.location.reload()
       return
     }
 
@@ -1151,7 +1180,7 @@ function App() {
     }
 
     setCommandLineInput('')
-  }, [commandAliases, commandLineInput, openHelpWindow, panelVisibility, setPanelOpenState])
+  }, [bringPanelToFront, commandAliases, commandLineInput, panelVisibility, projectRoot, setPanelOpenState])
 
   const startCommandLineDrag = useCallback(
     (event: ReactMouseEvent<HTMLElement>) => {
@@ -1164,19 +1193,6 @@ function App() {
       }
     },
     [bringCommandLineToFront, commandLineWindow.x, commandLineWindow.y],
-  )
-
-  const startHelpDrag = useCallback(
-    (event: ReactMouseEvent<HTMLElement>) => {
-      bringHelpToFront()
-      helpDragRef.current = {
-        startX: event.clientX,
-        startY: event.clientY,
-        originX: helpWindow.x,
-        originY: helpWindow.y,
-      }
-    },
-    [bringHelpToFront, helpWindow.x, helpWindow.y],
   )
 
   const updateAliasKeyword = useCallback((index: number, value: string) => {
@@ -1210,7 +1226,15 @@ function App() {
       <div className="ide-app">
         <aside className="activity-bar">
           <button className="activity-btn active">Files</button>
-          <button className="activity-btn">Git</button>
+          <button
+            className="activity-btn"
+            onClick={() => {
+              setPanelOpenState('git', true)
+              bringPanelToFront('git')
+            }}
+          >
+            Git
+          </button>
           <button className="activity-btn">AI</button>
         </aside>
 
@@ -1228,16 +1252,6 @@ function App() {
             onBringToFront={bringCommandLineToFront}
             onDragStart={startCommandLineDrag}
           />
-          <HelpPanel
-            isOpen={helpOpen}
-            width={HELP_PANEL_WIDTH}
-            height={HELP_PANEL_HEIGHT}
-            windowState={helpWindow}
-            onClose={() => setHelpOpen(false)}
-            onBringToFront={bringHelpToFront}
-            onDragStart={startHelpDrag}
-          />
-
           <OptionsModal
             isOpen={optionsOpen}
             optionsTab={optionsTab}
